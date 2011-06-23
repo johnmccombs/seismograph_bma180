@@ -38,7 +38,7 @@ const int16_t CS_SD = 4;
 const int16_t CS_ETHERNET = 10;
 
 // uncomment for debugging messages on the serial port
-// #define DEBUG 1
+//#define DEBUG 1
 
 /*-------------------------------------------------------------------------------------
   the timer interrupt has limits as to how long the interval can be, so the timer
@@ -122,17 +122,20 @@ const float thresholdFactor = 1.7;
 
 // flag to signal and event has been detected
 volatile uint8_t eventDetected = 0;
-volatile uint8_t eventPriorDetected = 0;
+
 
 // stores the accelerometer no-signal offsets
 int32_t accX0;
 int32_t accY0;
 int32_t accZ0;
 
-// sampleing trigger thresholds
+// sampling trigger thresholds
 int32_t accX0Threshold;
 int32_t accY0Threshold;
 int32_t accZ0Threshold;
+
+// must be at least this many consecutive counts > the x,y or z threshold
+static uint8_t consectiveEventThreshold = 3;
 
 
 /*-------------------------------------------------------------------------------------*/
@@ -145,9 +148,12 @@ const int16_t pinRedLED = 22;
 // indicates data being written to the SD card
 const int16_t pinGreenLED = 23;
 
+
 // Connect via SPI. Data pin is #3, Clock is #2 and Latch is #4
 LiquidCrystal lcd(30, 31, 32);
   
+const uint8_t LCD_WIDTH = 16;
+const uint8_t LCD_HEIGHT = 2;
   
 
 /*=====================================================================================*/
@@ -168,6 +174,8 @@ void setup()
    
   // enable  I2C
   Wire.begin();
+  
+  msgStatus("Calibrating");
   
   initBMA180();
   
@@ -267,11 +275,10 @@ void loop()
       if (!file.sync()) error("file.sync");
       if (!file.close()) error("file.close");
       openNewFile();
-      msgStatus("New file ");
       msgData(fileName);
       
       // redo calibration ** REFACTOR so uses data from the ring buffer
-      msgStatus("Calibrate");
+      msgStatus("Calibrating");
       TimerTwo::stop();
       initReferences();
       TimerTwo::start();
@@ -309,6 +316,9 @@ void msgStatus(char *msg) {
   // status messages on the top line of the display
   lcd.setCursor(0, 0);
   lcd.print(msg); 
+  
+  for (int i = strlen(msg); i < LCD_WIDTH-1; i++)  
+    lcd.print(" ");
 
 }
 
@@ -319,6 +329,9 @@ void msgData(char *msg) {
   // data messages on the bottom line of the display
   lcd.setCursor(0, 1);
   lcd.print(msg); 
+  
+  for (int i = strlen(msg); i < LCD_WIDTH-1; i++)  
+    lcd.print(" ");
 
 }
 
@@ -349,7 +362,7 @@ void initUI() {
   digitalWrite(pinStopSwitch, HIGH); 
   
   //lcd
-  lcd.begin(16, 2);
+  lcd.begin(LCD_WIDTH, LCD_HEIGHT);
   msgStatus("Startup");
   
 }
@@ -419,7 +432,7 @@ void initBMA180() {
   bma180.setRegValue(0x21, 0x00, 0x04);  
   
   // enable low pass filter - expect seismic signals to be <50Hz
-  bma180.SetFilter(bma180.F40HZ);
+  bma180.SetFilter(bma180.F20HZ);
   
   // set to 1g full scale
   bma180.setGSensitivty(bma180.G1);
@@ -505,6 +518,7 @@ void readBMA180() {
   // counts ticks between logging
   static uint16_t tickCt = TICKS_PER_LOG;
   static uint32_t serialNo = 0;
+  static uint8_t consecutiveEvents = 0;
   
   // return if not time to log data
   if (tickCt++ > TICKS_PER_LOG) {
@@ -532,19 +546,18 @@ void readBMA180() {
     ring[head].y = bma180.y - accY0;
     ring[head].z = bma180.z - accZ0;
   
-    // flag of acceleration sensed - must be over the threshold for 2 consecutive samples
+    // flag of acceleration sensed - must be over the threshold for n consecutive samples
     if (abs(ring[head].x) > accX0Threshold || abs(ring[head].y) > accY0Threshold || abs(ring[head].z) > accZ0Threshold ) {
       
-      if (eventPriorDetected) {
+      if (consecutiveEvents++ >= consectiveEventThreshold) {
         eventDetected = -1;
-        eventPriorDetected = 0;
+        consecutiveEvents = 0;
       } else {
-        eventPriorDetected = -1;
         eventDetected = 0;
       } 
       
     } else
-      eventPriorDetected = 0;
+      consecutiveEvents = 0;
  
     head = next;
        
