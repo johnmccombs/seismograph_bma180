@@ -1,7 +1,7 @@
 
 /*
 
-  Seismograph 2
+  Seismograph 2 - really a strong motion acclerograph
   
   Features
    - uses Bosch BMA180 3-axis accelerometer
@@ -33,6 +33,10 @@
 #include <SdFatUtil.h>
 #include <TimerTwo.h>
 
+#include <Time.h>  
+#include <DS1307RTC.h>  // DS1307 lib is close enough for the DS3231 in the chronodot
+
+
 // SPI CS pins
 const int16_t CS_SD = 4;
 const int16_t CS_ETHERNET = 10;
@@ -49,7 +53,7 @@ const int16_t CS_ETHERNET = 10;
 */
 
 // interval in usec between accelerometer samples
-const uint32_t LOG_INTERVAL_USEC = 5000;
+const uint32_t LOG_INTERVAL_USEC = 5000L;
 
 // interval between timer interrupts in microseconds
 const uint16_t TICK_USEC = 500;
@@ -72,7 +76,7 @@ char fileName[13];
 // store error strings in flash
 #define error(s) sd.errorHalt_P(PSTR(s));
 
-// flush the buffer this many data points
+// flush the SD buffer this many data points
 const int16_t SYNC_COUNT = 100;
 
 
@@ -85,7 +89,7 @@ const int16_t SYNC_COUNT = 100;
 // structure to store the reading. 'serial' is a sequential serial number for each reading.
 // useful for spotting problems with dropped samples or ring buffer bugs
 typedef struct {
-  uint16_t serial;
+  int16_t serial;
   int16_t x;
   int16_t y;
   int16_t z;
@@ -117,7 +121,7 @@ BMA180 bma180;
 const int16_t calibrationSamples = 200;
 
 // set the recording trigger threshold to max/min deviation from mean, multiplied by this
-const float thresholdFactor = 1.7;
+const float thresholdFactor = 1.9;
 
 
 // flag to signal and event has been detected
@@ -159,14 +163,15 @@ const uint8_t LCD_HEIGHT = 2;
 /*=====================================================================================*/
 void setup()
 {
+
   
 #ifdef DEBUG
   Serial.begin(9600);
 #endif
-
+    
   initUI();
   
-  // enable the SD card on EtherShield
+  // enable the SD card on Ethernet Shield
   pinMode(CS_SD, OUTPUT);
   pinMode(CS_ETHERNET, OUTPUT);
   digitalWrite(CS_SD, LOW);
@@ -176,6 +181,8 @@ void setup()
   Wire.begin();
   
   msgStatus("Calibrating");
+  
+  syncTime();
   
   initBMA180();
   
@@ -207,6 +214,8 @@ void setup()
 }
 
 
+
+
 /*=====================================================================================*/
 void loop()
 {
@@ -215,7 +224,7 @@ void loop()
   static uint32_t eventStart = -(EVENT_TIMEOUT+100);   // time in milliseconds the event started
   static uint8_t lastEventState = 0;                   // tracks if an event was in progress last time 'loop' was called
   int inEvent = 0;                                     // true is an event is in progress
-  char buf[25];
+  char buf[35];
 
   // how many samples are available in the ring buffer
   cli();
@@ -224,9 +233,21 @@ void loop()
  
   // if an event was detected, write the time to the start of the file
   // if it's the start of an event. clear eventDetected and record the start time
+  // in the file
   if (eventDetected) {
     if (!lastEventState) {
-      if (!file.write("START\n", 6)) error("file.write");
+      
+      // start time of data is now (st + frac) - number of points in the buffer (offset ms)
+      time_t st = now();
+      uint32_t frac = millis() % 1000L;
+      uint32_t offset = ((n * LOG_INTERVAL_USEC)/1000.0);
+
+      sprintf(buf ,"START %lu %lu %lu", st, frac, offset);
+      file.println(buf);   
+      
+      sprintf(buf ,"%d-%02d-%02d %02d:%02d:%02d", year(st), month(st), day(st), hour(st), minute(st), second(st));
+      file.println(buf);   
+      
     }
     eventDetected = 0;
     eventStart = millis();  
@@ -269,45 +290,93 @@ void loop()
   if (!inEvent) {
     
     // if event just ended
-    if (lastEventState) {
-      
-      // close the file and open another
-      if (!file.sync()) error("file.sync");
-      if (!file.close()) error("file.close");
-      openNewFile();
-      msgData(fileName);
-      
-      // redo calibration ** REFACTOR so uses data from the ring buffer
-      msgStatus("Calibrating");
-      TimerTwo::stop();
-      initReferences();
-      TimerTwo::start();
-      
-      msgReady();
-      
-    }
-    
+    if (lastEventState) 
+      handleEventEnded();
+ 
   }  
     
 
   // pressed the stop switch, sync the file and close it and shut down.
-  if (digitalRead(pinStopSwitch) == LOW) {
-    if (!file.sync()) error("file.sync");
-    if (!file.close()) error("file.close");
-    cli();
-    
-    PgmPrintln("Stopped!");
-    msgStatus("Stopped!");
-    
-    digitalWrite(pinRedLED, LOW);
-    digitalWrite(pinGreenLED, LOW);
-    
-    while (1);
-  }
+  if (digitalRead(pinStopSwitch) == LOW) 
+    doStop();
   
   lastEventState = inEvent;
 
 }
+
+
+/*-------------------------------------------------------------------------------------*/
+void handleEventEnded() {
+  
+  // event just ended. close the data file, open another one and
+  // recalibrate the accelerometer. note that the sampling interrupt
+  // must be diabled for this
+
+  // close the file and open another
+  if (!file.sync()) error("file.sync");
+  if (!file.close()) error("file.close");
+  
+  // disable sampling interrupt. need to use RTC clock and re-zero the accelerometer
+  TimerTwo::stop();
+  
+  openNewFile();
+  msgData(fileName);
+  
+  // redo calibration ** REFACTOR so uses data from the ring buffer
+  initReferences();
+  
+  // re-enable sample interrupts
+  TimerTwo::start();
+  
+  msgReady();  
+
+}
+
+
+
+/*-------------------------------------------------------------------------------------*/
+void doStop() {
+    // close the data file and stop the program
+
+  if (!file.sync()) error("file.sync");
+  if (!file.close()) error("file.close");
+  cli();
+  
+  PgmPrintln("Stopped!");
+  msgStatus("Stopped!");
+  
+  digitalWrite(pinRedLED, LOW);
+  digitalWrite(pinGreenLED, LOW);
+  
+  while (1);
+}
+
+
+
+
+/*-------------------------------------------------------------------------------------*/
+void syncTime() {
+  // get time from the RTC clock chip
+  
+  // this sets the RTC clock as the time provider and forces a
+  // the time library to sync its time from the RTC
+  setSyncProvider(RTC.get);
+  
+#ifdef DEBUG
+  if(timeStatus()!= timeSet) 
+     Serial.println("Unable to sync with the RTC");
+  else {
+     Serial.println("RTC has set the system time");  
+  }  
+#endif
+
+  // disable time sync'ing - we don't want conflicts with the accelerometer
+  setSyncProvider(0);
+
+}
+
+
+
 
 
 /*-------------------------------------------------------------------------------------*/
@@ -371,17 +440,25 @@ void initUI() {
 /*-------------------------------------------------------------------------------------*/
 void openNewFile() {
   
-  // create a new file
-  for (uint8_t n = 0; n < 1000; n++) {
-    sprintf(fileName, "QUAKE%03d.CSV", n);
-    if (file.open(fileName, O_WRITE | O_CREAT | O_EXCL)) break;
-  }
-  if (!file.isOpen()) {
+  //resync the time against the RTC
+  syncTime();
+  
+  sprintf(fileName, "%02d%02d%02d%02d.CSV", day(), hour(), minute(), second());
+  
+#ifdef DEBUG
+  Serial.println(fileName);
+#endif
+
+  if (!file.open(fileName, O_WRITE | O_CREAT | O_EXCL)) {
     msgStatus("File open err");
     error("file.open");
   }
   
-  file.write_P(PSTR("Log Interval usec: "));
+  if (!file.isOpen()) {
+    msgStatus("File not open");
+    error("file.open");
+  }
+
   file.println(LOG_INTERVAL_USEC); 
  
 } 
@@ -412,21 +489,7 @@ void initBMA180() {
   // ultra-low noise mode
 //  bma180.setRegValue(0x30, 0x01, 0x03);
 
-  // full calibration
-  bma180.setRegValue(0x22, 0x03, 0x03);
-  
-  // calibrate each axis in turn. set the en_offset_* bit to request
-  // the offset be set and wait until the bit is cleared, indicating
-  // the calibration os compete. Takes a couple of seconds
-  bma180.setRegValue(0x0E, 0x01 << 5, 0xE0);
-  while ((bma180.getRegValue(0x0E) & 0xE0)) delay(5);
-  
-  bma180.setRegValue(0x0E, 0x01 << 6, 0xE0);
-  while ((bma180.getRegValue(0x0E) & 0xE0)) delay(5);
-  
-  bma180.setRegValue(0x0E, 0x01 << 7, 0xE0);
-  while ((bma180.getRegValue(0x0E) & 0xE0)) delay(5);
-
+  doBMA180Calibration();
 
   // Turn off adv_int 
   bma180.setRegValue(0x21, 0x00, 0x04);  
@@ -443,6 +506,28 @@ void initBMA180() {
   initReferences(); 
 
 }
+
+
+/*-------------------------------------------------------------------------------------*/
+void doBMA180Calibration() {
+  // do a calibration
+
+  // full calibration
+  bma180.setRegValue(0x22, 0x03, 0x03);
+  
+  // calibrate each axis in turn. set the en_offset_* bit to request
+  // the offset be set and wait until the bit is cleared, indicating
+  // the calibration is compete. Takes a couple of seconds
+  bma180.setRegValue(0x0E, 0x01 << 5, 0xE0);
+  while ((bma180.getRegValue(0x0E) & 0xE0)) delay(5);
+  
+  bma180.setRegValue(0x0E, 0x01 << 6, 0xE0);
+  while ((bma180.getRegValue(0x0E) & 0xE0)) delay(5);
+  
+  bma180.setRegValue(0x0E, 0x01 << 7, 0xE0);
+  while ((bma180.getRegValue(0x0E) & 0xE0)) delay(5);
+}
+
 
 
 
@@ -462,8 +547,11 @@ void initReferences() {
   int32_t accX0max = -99999;
   int32_t accY0max = -99999;
   int32_t accZ0max = -99999;
- 
+  
+  msgStatus("Calibrating");
+  doBMA180Calibration();
 
+  msgStatus("Set Threshold");
   // sum the readings and collect max/min values for samples at 20ms intervals
   for (int16_t i = 0; i < calibrationSamples; i++) {
     
@@ -517,7 +605,7 @@ void readBMA180() {
   
   // counts ticks between logging
   static uint16_t tickCt = TICKS_PER_LOG;
-  static uint32_t serialNo = 0;
+  static uint16_t serialNo = 0;
   static uint8_t consecutiveEvents = 0;
   
   // return if not time to log data
