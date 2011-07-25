@@ -495,7 +495,7 @@ void initBMA180() {
   bma180.setRegValue(0x21, 0x00, 0x04);  
   
   // enable low pass filter - expect seismic signals to be <50Hz
-  bma180.SetFilter(bma180.F20HZ);
+  bma180.SetFilter(bma180.F40HZ);
   
   // set to 1g full scale
   bma180.setGSensitivty(bma180.G1);
